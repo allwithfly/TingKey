@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Model weights (download separately)
+model/
+model-1.7b/
+
+# Local recordings
+recordings/
+
+# FFmpeg binary (download separately)
+ffmpeg/
+ffmpeg-*.7z
+
+# Local config (contains absolute paths)
+desktop_service_config.json
+
+# Benchmark outputs
+benchmark_report*.json
+benchmark_report*.md
+*.srt
+
+# Environment
+.env
+.venv/
+venv/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

@@ -1,0 +1,51 @@
+{
+  "shortcuts": {
+    "hotkey": "LeftCtrl+LeftWin",
+    "short_press_action": "speech_assistant",
+    "long_press_action": "voice_input",
+    "smart_mouse_mode": false
+  },
+  "microphone": {
+    "device": "auto",
+    "mute_during_recording": false,
+    "recording_dir": "recordings"
+  },
+  "system": {
+    "auto_start": false,
+    "silent_start": false,
+    "transcription_language": "zh-CN",
+    "enable_logs": false
+  },
+  "lab": {
+    "direct_input_no_clipboard": true,
+    "text_normalization": false
+  },
+  "skills": {
+    "auto_run": false,
+    "personalize_enabled": false,
+    "personalize_prompt": "",
+    "load_user_dictionary": false,
+    "auto_structure": false,
+    "enhancement_enabled": true,
+    "enhancement_preset": "voice_input",
+    "remove_fillers": true,
+    "auto_punctuation": true,
+    "dedupe_repeats": true,
+    "normalize_spacing": true,
+    "user_dictionary_text": ""
+  },
+  "model": {
+    "asr_model_size": "0.6b",
+    "asr_model_dir": "./model",
+    "asr_backend": "transformers",
+    "asr_dtype": "auto",
+    "asr_max_new_tokens": 256,
+    "asr_max_inference_batch_size": 8,
+    "asr_attn_implementation": "auto",
+    "asr_enable_tf32": true,
+    "asr_cudnn_benchmark": true,
+    "enable_final_asr": false,
+    "llm_provider": null,
+    "llm_model": null
+  }
+}
