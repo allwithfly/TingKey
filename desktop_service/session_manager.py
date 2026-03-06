@@ -98,9 +98,16 @@ class SessionManager:
     def stop_session(self, session_id: str) -> SessionRecord:
         with self._lock:
             session = self.get_session(session_id)
-            if session.status == SessionStatus.RECORDING and session.wave_writer is not None:
-                session.wave_writer.close()
-                session.wave_writer = None
+            if session.status == SessionStatus.STOPPED:
+                raise ValueError(f"session {session_id} is already stopped")
+            if session.status != SessionStatus.RECORDING:
+                raise ValueError(
+                    f"session {session_id} cannot be stopped from status {session.status.value}"
+                )
+            if session.wave_writer is None:
+                raise RuntimeError(f"session {session_id} writer unavailable")
+            session.wave_writer.close()
+            session.wave_writer = None
             session.status = SessionStatus.STOPPED
             session.updated_at = utc_now_iso()
             self._publish(
@@ -118,6 +125,10 @@ class SessionManager:
     def mark_processing(self, session_id: str) -> SessionRecord:
         with self._lock:
             session = self.get_session(session_id)
+            if session.status != SessionStatus.STOPPED:
+                raise ValueError(
+                    f"session {session_id} cannot enter processing from status {session.status.value}"
+                )
             session.status = SessionStatus.PROCESSING
             session.updated_at = utc_now_iso()
             self._publish(
@@ -134,6 +145,10 @@ class SessionManager:
     ) -> SessionRecord:
         with self._lock:
             session = self.get_session(session_id)
+            if session.status not in {SessionStatus.STOPPED, SessionStatus.PROCESSING}:
+                raise ValueError(
+                    f"session {session_id} cannot complete from status {session.status.value}"
+                )
             session.status = SessionStatus.COMPLETED
             session.final_text = final_text
             session.final_model_time_s = final_model_time_s
@@ -152,6 +167,9 @@ class SessionManager:
     def mark_error(self, session_id: str, message: str) -> SessionRecord:
         with self._lock:
             session = self.get_session(session_id)
+            if session.wave_writer is not None:
+                session.wave_writer.close()
+                session.wave_writer = None
             session.status = SessionStatus.ERROR
             session.error_message = message
             session.updated_at = utc_now_iso()
@@ -220,6 +238,5 @@ class SessionManager:
                 pass
             try:
                 q.put_nowait(payload)
-            except Exception:
+            except Full:
                 pass
-

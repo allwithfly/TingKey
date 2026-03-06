@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import gc
-import os
 import shlex
 import tempfile
 import time
@@ -10,33 +9,25 @@ from pathlib import Path
 
 import torch
 
+from asr_frontend_common import (
+    build_subtitle_path,
+    default_binary_path,
+    format_transcription_result_lines,
+    validate_runtime_numeric_args,
+)
 from asr_media_utils import (
+    batched_transcribe_rows,
     build_time_segments,
     default_batch_size,
     expand_media_inputs,
     format_hms,
-    get_media_duration_seconds,
     normalize_cli_path,
-    prepare_audio_input,
+    prepare_media_inputs,
     resolve_model_dir,
     save_srt_file,
     transcribe_with_timestamp_fallback,
 )
 from speech_output import QwenSpeechOutput
-
-
-def default_binary_path(exe_name: str, fallback: str) -> str:
-    candidates: list[Path] = []
-    env_dir = os.environ.get("QWEN_ASR_FFMPEG_DIR", "").strip()
-    if env_dir:
-        candidates.append(Path(env_dir).expanduser())
-    candidates.append(Path(__file__).resolve().parent / "ffmpeg" / "bin")
-    candidates.append(Path(__file__).resolve().parent)
-    for root in candidates:
-        target = (root / exe_name).resolve()
-        if target.exists():
-            return str(target)
-    return fallback
 
 
 def split_user_inputs(line: str) -> list[str]:
@@ -52,11 +43,6 @@ def split_user_inputs(line: str) -> list[str]:
             if value:
                 tokens.append(value)
     return tokens
-
-
-def build_subtitle_path(subtitle_dir: str, source_media: str) -> Path:
-    source = Path(source_media)
-    return Path(subtitle_dir).expanduser().resolve() / f"{source.stem}.srt"
 
 
 class ASRResidentShell:
@@ -138,6 +124,16 @@ class ASRResidentShell:
         return self.return_time_stamps or bool(self.subtitle_dir)
 
     def start(self, hint: str | None = None) -> None:
+        try:
+            validate_runtime_numeric_args(
+                max_inference_batch_size=self.max_inference_batch_size,
+                max_new_tokens=self.max_new_tokens,
+                gpu_memory_utilization=self.gpu_memory_utilization,
+            )
+        except ValueError as exc:
+            print(f"[ERROR] {exc}")
+            return
+
         model_dir_arg = self.default_model_dir_arg
         model_size = self.default_model_size
 
@@ -228,38 +224,77 @@ class ASRResidentShell:
 
     def transcribe(self, raw_inputs: list[str]) -> None:
         if self.engine is None:
-            print("服务未启动，请先输入 `启动` 或 `start`")
+            print("Service is not started. Run `start` first.")
             return
         if self.temp_dir_obj is None:
-            print("[ERROR] 临时目录不可用，请重启服务")
+            print("[ERROR] Temporary directory is unavailable. Restart the service.")
             return
 
         media_paths, missing = expand_media_inputs(raw_inputs)
         if missing:
-            print(f"[WARN] 以下输入未匹配到文件，已跳过: {missing}")
+            print(f"[WARN] Skipped unmatched inputs: {missing}")
         if not media_paths:
-            print("[WARN] 没有可识别的文件")
+            print("[WARN] No valid input files found.")
             return
 
         need_timestamps = self._need_timestamps()
-        print(f"开始识别，共 {len(media_paths)} 个文件...")
-        for index, media_path in enumerate(media_paths, start=1):
-            try:
-                prepared_audio, was_extracted = prepare_audio_input(
-                    media_path,
-                    temp_dir=self.temp_dir_obj.name,
-                    ffmpeg_bin=self.ffmpeg_bin,
-                )
-                audio_duration_s = get_media_duration_seconds(
-                    prepared_audio,
-                    ffprobe_bin=self.ffprobe_bin,
-                )
+        print(f"Starting transcription for {len(media_paths)} file(s)...")
 
+        prepared_rows = []
+        for media_path in media_paths:
+            try:
+                prepared_rows.extend(
+                    prepare_media_inputs(
+                        [media_path],
+                        temp_dir=self.temp_dir_obj.name,
+                        ffmpeg_bin=self.ffmpeg_bin,
+                        ffprobe_bin=self.ffprobe_bin,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[ERROR] Failed to prepare media: {media_path}")
+                print(f"detail: {exc}")
+
+        if not prepared_rows:
+            return
+
+        batch_size = (
+            self.max_inference_batch_size
+            if self.max_inference_batch_size is not None
+            else default_batch_size(self.running_model_size or self.default_model_size)
+        )
+
+        if not need_timestamps:
+            try:
+                normalized = batched_transcribe_rows(
+                    prepared_rows,
+                    batch_size=batch_size,
+                    transcribe_batch=lambda batch_audio: self.engine.transcribe(
+                        audio=batch_audio,
+                        language=self.language,
+                        return_time_stamps=False,
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001
+                print("[ERROR] Batch transcription failed.")
+                print(f"detail: {exc}")
+                return
+
+            for index, item in enumerate(normalized, start=1):
+                for line in format_transcription_result_lines(
+                    item,
+                    header_label=f"{index}/{len(normalized)}",
+                ):
+                    print(line)
+            return
+
+        for index, row in enumerate(prepared_rows, start=1):
+            try:
                 request_timestamps = need_timestamps and self.timestamps_supported is not False
                 t0 = time.time()
                 result, used_timestamps = transcribe_with_timestamp_fallback(
                     lambda return_ts: self.engine.transcribe(
-                        audio=prepared_audio,
+                        audio=row.prepared_audio,
                         language=self.language,
                         return_time_stamps=return_ts,
                     ),
@@ -269,7 +304,7 @@ class ASRResidentShell:
                 if request_timestamps and not used_timestamps:
                     if self.timestamps_supported is not False:
                         print(
-                            "[WARN] forced_aligner 未初始化，时间戳已降级为粗粒度整段区间。"
+                            "[WARN] Timestamps disabled because forced_aligner is unavailable. Falling back to coarse segments."
                         )
                     self.timestamps_supported = False
                 elif request_timestamps and used_timestamps:
@@ -279,31 +314,33 @@ class ASRResidentShell:
                 segments = build_time_segments(
                     result.get("time_stamps") if used_timestamps else [],
                     text=text,
-                    fallback_duration_s=audio_duration_s,
+                    fallback_duration_s=row.audio_duration_s,
                 ) if need_timestamps else []
 
                 subtitle_path: str | None = None
                 if self.subtitle_dir:
-                    target = build_subtitle_path(self.subtitle_dir, media_path)
+                    target = build_subtitle_path(self.subtitle_dir, row.source_media)
                     save_srt_file(segments, target)
                     subtitle_path = str(target)
 
-                print(f"[{index}/{len(media_paths)}] audio={media_path}")
-                if was_extracted:
-                    print(f"source_type=video extracted_audio={prepared_audio}")
-                print(f"language={result.get('language')}")
-                print(f"audio_duration={format_hms(audio_duration_s)}")
-                print(f"model_inference_time={format_hms(model_inference_time_s)}")
-                for seg_index, segment in enumerate(segments):
-                    print(
-                        f"segment[{seg_index}] start={format_hms(segment.get('start_time'))} "
-                        f"end={format_hms(segment.get('end_time'))} text={segment.get('text', '')}"
-                    )
-                if subtitle_path:
-                    print(f"subtitle={subtitle_path}")
-                print(f"text={text}")
+                shell_result = {
+                    "audio": row.source_media,
+                    "prepared_audio": row.prepared_audio,
+                    "source_type": row.source_type,
+                    "language": result.get("language"),
+                    "audio_duration_s": row.audio_duration_s,
+                    "model_inference_time_s": model_inference_time_s,
+                    "segments": segments,
+                    "subtitle_path": subtitle_path,
+                    "text": text,
+                }
+                for line in format_transcription_result_lines(
+                    shell_result,
+                    header_label=f"{index}/{len(prepared_rows)}",
+                ):
+                    print(line)
             except Exception as exc:  # noqa: BLE001
-                print(f"[ERROR] 识别失败: {media_path}")
+                print(f"[ERROR] Transcription failed: {row.source_media}")
                 print(f"detail: {exc}")
 
     def run(self) -> None:
@@ -447,12 +484,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--ffmpeg-bin",
-        default=default_binary_path("ffmpeg.exe", "ffmpeg"),
+        default=default_binary_path("ffmpeg.exe", "ffmpeg", base_dir=Path(__file__).resolve().parent),
         help="ffmpeg executable path used for video audio extraction",
     )
     parser.add_argument(
         "--ffprobe-bin",
-        default=default_binary_path("ffprobe.exe", "ffprobe"),
+        default=default_binary_path("ffprobe.exe", "ffprobe", base_dir=Path(__file__).resolve().parent),
         help="ffprobe executable path used for duration probing",
     )
     parser.add_argument(
@@ -464,7 +501,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
     if args.fast_mode:
         if args.dtype == "auto":
             args.dtype = "float16"
@@ -472,6 +510,15 @@ def main() -> None:
             args.max_new_tokens = 96
         if args.attn_implementation == "auto":
             args.attn_implementation = "flash_attention_2"
+
+    try:
+        validate_runtime_numeric_args(
+            max_inference_batch_size=args.max_inference_batch_size,
+            max_new_tokens=args.max_new_tokens,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     shell = ASRResidentShell(
         model_dir_arg=args.model_dir,

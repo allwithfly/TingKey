@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import json
 from queue import Empty
 from pathlib import Path
@@ -15,6 +16,7 @@ from desktop_service.config_models import AppConfig
 from desktop_service.config_store import ConfigStore
 from desktop_service.final_asr import FinalAsrConfig, FinalAsrRunner
 from desktop_service.session_manager import SessionManager
+from speech_output import QwenSpeechOutput
 
 
 class StartSessionRequest(BaseModel):
@@ -46,6 +48,23 @@ class PatchConfigRequest(BaseModel):
     values: dict[str, Any]
 
 
+class DirectTranscribeRequest(BaseModel):
+    audio: list[str]
+    language: str | None = None
+    return_time_stamps: bool = False
+    model_dir: str
+    device: str = "auto"
+    backend: str = "transformers"
+    dtype: str = "auto"
+    gpu_memory_utilization: float = 0.7
+    attn_implementation: str = "auto"
+    enable_tf32: bool = True
+    cudnn_benchmark: bool = True
+    max_inference_batch_size: int = 8
+    max_new_tokens: int = 256
+    aligner_dir: str | None = None
+
+
 def _build_final_asr_runner(config: AppConfig) -> FinalAsrRunner:
     model = config.model
     cfg = FinalAsrConfig(
@@ -61,7 +80,9 @@ def _build_final_asr_runner(config: AppConfig) -> FinalAsrRunner:
         enable_tf32=model.asr_enable_tf32,
         cudnn_benchmark=model.asr_cudnn_benchmark,
     )
-    return FinalAsrRunner(cfg)
+    runner = FinalAsrRunner(cfg)
+    runner.schedule_warmup()
+    return runner
 
 
 def create_app(
@@ -110,6 +131,36 @@ def create_app(
     def list_sessions() -> list[dict[str, Any]]:
         return [s.to_public_dict() for s in session_manager.list_sessions()]
 
+    @app.post("/v1/asr/transcribe-files")
+    def direct_transcribe(req: DirectTranscribeRequest) -> list[dict[str, Any]]:
+        try:
+            engine = QwenSpeechOutput(
+                model_path=req.model_dir,
+                device=req.device,
+                dtype=req.dtype,  # type: ignore[arg-type]
+                backend=req.backend,  # type: ignore[arg-type]
+                gpu_memory_utilization=req.gpu_memory_utilization,
+                attn_implementation=req.attn_implementation,  # type: ignore[arg-type]
+                enable_tf32=req.enable_tf32,
+                cudnn_benchmark=req.cudnn_benchmark,
+                max_inference_batch_size=req.max_inference_batch_size,
+                max_new_tokens=req.max_new_tokens,
+                forced_aligner_path=req.aligner_dir,
+            )
+            return engine.transcribe(
+                audio=req.audio,
+                language=req.language,
+                return_time_stamps=req.return_time_stamps,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
     @app.post("/v1/sessions/start")
     def start_session(req: StartSessionRequest) -> dict[str, Any]:
         session = session_manager.start_session(
@@ -132,10 +183,16 @@ def create_app(
     @app.post("/v1/sessions/{session_id}/chunk")
     def add_chunk(session_id: str, req: ChunkRequest) -> dict[str, Any]:
         try:
-            payload = base64.b64decode(req.audio_base64)
+            payload = base64.b64decode(req.audio_base64, validate=True)
             session = session_manager.add_chunk(session_id, payload)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except binascii.Error as exc:
+            raise HTTPException(status_code=400, detail="invalid base64 audio payload") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return session.to_public_dict()
@@ -174,6 +231,8 @@ def create_app(
             session = session_manager.stop_session(session_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -227,3 +286,4 @@ def create_app(
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 
     return app
+

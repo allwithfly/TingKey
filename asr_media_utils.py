@@ -3,8 +3,10 @@ from __future__ import annotations
 import glob
 import hashlib
 import subprocess
+import time
 import unicodedata
 import wave
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -27,6 +29,14 @@ VIDEO_EXTENSIONS = {
 FORCED_ALIGNER_REQUIRED_FRAGMENT = (
     "return_time_stamps=True requires `forced_aligner`"
 )
+
+
+@dataclass(frozen=True)
+class PreparedMediaInput:
+    source_media: str
+    prepared_audio: str
+    source_type: str
+    audio_duration_s: float | None
 
 
 def normalize_cli_path(raw_path: str) -> str:
@@ -161,6 +171,11 @@ def prepare_audio_input(
     temp_root.mkdir(parents=True, exist_ok=True)
     digest = hashlib.md5(str(source).encode("utf-8")).hexdigest()[:10]
     out_wav = temp_root / f"{source.stem}_{digest}.wav"
+    try:
+        if out_wav.exists() and out_wav.stat().st_mtime >= source.stat().st_mtime:
+            return str(out_wav), True
+    except OSError:
+        pass
     extract_audio_with_ffmpeg(source, out_wav, ffmpeg_bin=ffmpeg_bin)
     return str(out_wav), True
 
@@ -212,6 +227,72 @@ def get_media_duration_seconds(path: str | Path, ffprobe_bin: str = "ffprobe") -
         pass
 
     return None
+
+
+def prepare_media_inputs(
+    media_paths: list[str],
+    temp_dir: str | Path,
+    ffmpeg_bin: str = "ffmpeg",
+    ffprobe_bin: str = "ffprobe",
+) -> list[PreparedMediaInput]:
+    prepared_rows: list[PreparedMediaInput] = []
+    for media_path in media_paths:
+        prepared_audio, was_extracted = prepare_audio_input(
+            media_path,
+            temp_dir=temp_dir,
+            ffmpeg_bin=ffmpeg_bin,
+        )
+        prepared_rows.append(
+            PreparedMediaInput(
+                source_media=media_path,
+                prepared_audio=prepared_audio,
+                source_type="video" if was_extracted else "audio",
+                audio_duration_s=get_media_duration_seconds(
+                    prepared_audio,
+                    ffprobe_bin=ffprobe_bin,
+                ),
+            )
+        )
+    return prepared_rows
+
+
+def batched_transcribe_rows(
+    rows: list[PreparedMediaInput],
+    batch_size: int,
+    transcribe_batch: Callable[[list[str]], list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+
+    normalized: list[dict[str, Any]] = []
+    for start_index in range(0, len(rows), batch_size):
+        batch_rows = rows[start_index : start_index + batch_size]
+        batch_audio = [row.prepared_audio for row in batch_rows]
+        started_at = time.perf_counter()
+        batch_results = transcribe_batch(batch_audio)
+        elapsed_s = time.perf_counter() - started_at
+        if len(batch_results) != len(batch_rows):
+            raise ValueError(
+                f"Batch starting at index {start_index} returned {len(batch_results)} result(s) "
+                f"for {len(batch_rows)} input(s)"
+            )
+
+        per_item_elapsed_s = elapsed_s / len(batch_rows) if batch_rows else 0.0
+        for row, result in zip(batch_rows, batch_results):
+            normalized.append(
+                {
+                    "audio": row.source_media,
+                    "prepared_audio": row.prepared_audio,
+                    "source_type": row.source_type,
+                    "language": result.get("language"),
+                    "audio_duration_s": row.audio_duration_s,
+                    "model_inference_time_s": per_item_elapsed_s,
+                    "text": result.get("text", ""),
+                    "segments": [],
+                    "subtitle_path": None,
+                }
+            )
+    return normalized
 
 
 def _to_float(value: Any) -> float | None:

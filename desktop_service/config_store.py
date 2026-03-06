@@ -62,10 +62,24 @@ class ConfigStore:
         try:
             payload = json.loads(self.config_path.read_text(encoding="utf-8"))
             return AppConfig(**payload)
-        except Exception:
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            self._preserve_invalid_config()
             cfg = AppConfig()
             self._save_data(_model_dump(cfg))
             return cfg
+
+    def _preserve_invalid_config(self) -> Path | None:
+        try:
+            raw_bytes = self.config_path.read_bytes()
+        except OSError:
+            return None
+        backup_path = Path(f"{self.config_path}.invalid")
+        suffix_index = 1
+        while backup_path.exists():
+            backup_path = Path(f"{self.config_path}.invalid.{suffix_index}")
+            suffix_index += 1
+        backup_path.write_bytes(raw_bytes)
+        return backup_path
 
     def _save(self) -> None:
         self._save_data(self.get_dict())
@@ -75,4 +89,3 @@ class ConfigStore:
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-

@@ -8,34 +8,28 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
+from asr_frontend_common import (
+    build_subtitle_path,
+    default_binary_path,
+    format_transcription_result_lines,
+    validate_runtime_numeric_args,
+)
 from asr_media_utils import (
+    batched_transcribe_rows,
     build_time_segments,
     default_batch_size,
     expand_media_inputs,
     format_hms,
-    prepare_audio_input,
+    prepare_media_inputs,
     resolve_model_dir,
     save_srt_file,
     transcribe_with_timestamp_fallback,
-    get_media_duration_seconds,
     normalize_cli_path,
 )
 from speech_output import QwenSpeechOutput
-
-
-def default_binary_path(exe_name: str, fallback: str) -> str:
-    candidates: list[Path] = []
-    env_dir = os.environ.get("QWEN_ASR_FFMPEG_DIR", "").strip()
-    if env_dir:
-        candidates.append(Path(env_dir).expanduser())
-    candidates.append(Path(__file__).resolve().parent / "ffmpeg" / "bin")
-    candidates.append(Path(__file__).resolve().parent)
-    for root in candidates:
-        target = (root / exe_name).resolve()
-        if target.exists():
-            return str(target)
-    return fallback
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -137,12 +131,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--ffmpeg-bin",
-        default=default_binary_path("ffmpeg.exe", "ffmpeg"),
+        default=default_binary_path("ffmpeg.exe", "ffmpeg", base_dir=Path(__file__).resolve().parent),
         help="ffmpeg executable path used for video audio extraction",
     )
     parser.add_argument(
         "--ffprobe-bin",
-        default=default_binary_path("ffprobe.exe", "ffprobe"),
+        default=default_binary_path("ffprobe.exe", "ffprobe", base_dir=Path(__file__).resolve().parent),
         help="ffprobe executable path used for duration probing",
     )
     parser.add_argument(
@@ -172,29 +166,79 @@ def format_segments_text(segments: list[dict]) -> list[str]:
 def to_text_lines(results: list[dict]) -> str:
     lines: list[str] = []
     for index, result in enumerate(results):
-        lines.append(f"[{index}] audio={result['audio']}")
-        if result.get("source_type") == "video":
-            lines.append(f"source_type=video extracted_audio={result.get('prepared_audio')}")
-        lines.append(f"language={result.get('language')}")
-        lines.append(f"audio_duration={format_hms(result.get('audio_duration_s'))}")
-        lines.append(
-            f"model_inference_time={format_hms(result.get('model_inference_time_s'))}"
-        )
-        if result.get("segments"):
-            lines.extend(format_segments_text(result["segments"]))
-        if result.get("subtitle_path"):
-            lines.append(f"subtitle={result['subtitle_path']}")
-        lines.append(f"text={result.get('text', '')}")
+        lines.extend(format_transcription_result_lines(result, header_label=str(index)))
     return "\n".join(lines)
 
 
-def build_subtitle_path(subtitle_dir: str, source_media: str) -> Path:
-    source = Path(source_media)
-    return Path(subtitle_dir).expanduser().resolve() / f"{source.stem}.srt"
+def _local_service_url() -> str:
+    return os.environ.get("QWEN_ASR_SERVICE_URL", "http://127.0.0.1:8765").rstrip("/")
+
+
+def _service_runtime_ready(service_url: str, timeout_s: float = 0.15) -> bool:
+    try:
+        with urllib_request.urlopen(f"{service_url}/health", timeout=timeout_s) as response:
+            return int(getattr(response, "status", 200)) == 200
+    except (urllib_error.URLError, TimeoutError, OSError, ValueError):
+        return False
+
+
+def _request_service_transcribe(
+    *,
+    service_url: str,
+    audio: list[str],
+    language: str | None,
+    return_time_stamps: bool,
+    model_dir: str | Path,
+    device: str,
+    backend: str,
+    dtype: str,
+    gpu_memory_utilization: float,
+    attn_implementation: str,
+    enable_tf32: bool,
+    cudnn_benchmark: bool,
+    max_inference_batch_size: int,
+    max_new_tokens: int,
+    aligner_dir: str | None,
+    timeout_s: float = 300.0,
+) -> list[dict] | None:
+    payload = {
+        "audio": audio,
+        "language": language,
+        "return_time_stamps": return_time_stamps,
+        "model_dir": str(Path(model_dir).expanduser().resolve()),
+        "device": device,
+        "backend": backend,
+        "dtype": dtype,
+        "gpu_memory_utilization": gpu_memory_utilization,
+        "attn_implementation": attn_implementation,
+        "enable_tf32": enable_tf32,
+        "cudnn_benchmark": cudnn_benchmark,
+        "max_inference_batch_size": max_inference_batch_size,
+        "max_new_tokens": max_new_tokens,
+        "aligner_dir": aligner_dir,
+    }
+    request = urllib_request.Request(
+        f"{service_url}/v1/asr/transcribe-files",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=timeout_s) as response:
+            body = response.read().decode("utf-8")
+    except (urllib_error.HTTPError, urllib_error.URLError, TimeoutError, OSError, ValueError):
+        return None
+
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, list) else None
 
 
 def main() -> None:
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
 
     if args.fast_mode:
         if args.dtype == "auto":
@@ -203,6 +247,15 @@ def main() -> None:
             args.max_new_tokens = 96
         if args.attn_implementation == "auto":
             args.attn_implementation = "flash_attention_2"
+
+    try:
+        validate_runtime_numeric_args(
+            max_inference_batch_size=args.max_inference_batch_size,
+            max_new_tokens=args.max_new_tokens,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     model_dir = resolve_model_dir(args.model_dir, args.model_size)
     if not model_dir.exists():
@@ -237,82 +290,144 @@ def main() -> None:
         )
         return
 
-    engine = QwenSpeechOutput(
-        model_path=model_dir,
-        device=args.device,
-        dtype=args.dtype,
-        backend=args.backend,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        attn_implementation=args.attn_implementation,
-        enable_tf32=not args.disable_tf32,
-        cudnn_benchmark=not args.disable_cudnn_benchmark,
-        max_inference_batch_size=max_inference_batch_size,
-        max_new_tokens=args.max_new_tokens,
-        forced_aligner_path=normalize_cli_path(args.aligner_dir) if args.aligner_dir else None,
-    )
+    aligner_dir = normalize_cli_path(args.aligner_dir) if args.aligner_dir else None
+    service_url = _local_service_url()
+    service_runtime_ready = _service_runtime_ready(service_url)
+    engine: QwenSpeechOutput | None = None
+
+    def get_engine() -> QwenSpeechOutput:
+        nonlocal engine
+        if engine is None:
+            engine = QwenSpeechOutput(
+                model_path=model_dir,
+                device=args.device,
+                dtype=args.dtype,
+                backend=args.backend,
+                gpu_memory_utilization=args.gpu_memory_utilization,
+                attn_implementation=args.attn_implementation,
+                enable_tf32=not args.disable_tf32,
+                cudnn_benchmark=not args.disable_cudnn_benchmark,
+                max_inference_batch_size=max_inference_batch_size,
+                max_new_tokens=args.max_new_tokens,
+                forced_aligner_path=aligner_dir,
+            )
+        return engine
+
+    def transcribe_batch(batch_audio: list[str]) -> list[dict]:
+        if service_runtime_ready:
+            rows = _request_service_transcribe(
+                service_url=service_url,
+                audio=batch_audio,
+                language=args.language,
+                return_time_stamps=False,
+                model_dir=model_dir,
+                device=args.device,
+                backend=args.backend,
+                dtype=args.dtype,
+                gpu_memory_utilization=args.gpu_memory_utilization,
+                attn_implementation=args.attn_implementation,
+                enable_tf32=not args.disable_tf32,
+                cudnn_benchmark=not args.disable_cudnn_benchmark,
+                max_inference_batch_size=max_inference_batch_size,
+                max_new_tokens=args.max_new_tokens,
+                aligner_dir=aligner_dir,
+            )
+            if rows is not None:
+                return rows
+        return get_engine().transcribe(
+            audio=batch_audio,
+            language=args.language,
+            return_time_stamps=False,
+        )
+
+    def transcribe_one(audio_path: str, return_ts: bool) -> list[dict]:
+        if service_runtime_ready:
+            rows = _request_service_transcribe(
+                service_url=service_url,
+                audio=[audio_path],
+                language=args.language,
+                return_time_stamps=return_ts,
+                model_dir=model_dir,
+                device=args.device,
+                backend=args.backend,
+                dtype=args.dtype,
+                gpu_memory_utilization=args.gpu_memory_utilization,
+                attn_implementation=args.attn_implementation,
+                enable_tf32=not args.disable_tf32,
+                cudnn_benchmark=not args.disable_cudnn_benchmark,
+                max_inference_batch_size=max_inference_batch_size,
+                max_new_tokens=args.max_new_tokens,
+                aligner_dir=aligner_dir,
+            )
+            if rows is not None:
+                return rows
+        return get_engine().transcribe(
+            audio=audio_path,
+            language=args.language,
+            return_time_stamps=return_ts,
+        )
 
     normalized: list[dict] = []
     timestamps_supported: bool | None = None
     with tempfile.TemporaryDirectory(prefix="qwen3_asr_media_") as temp_dir:
-        for media_path in media_paths:
-            prepared_audio, was_extracted = prepare_audio_input(
-                media_path,
-                temp_dir=temp_dir,
-                ffmpeg_bin=args.ffmpeg_bin,
+        prepared_rows = prepare_media_inputs(
+            media_paths,
+            temp_dir=temp_dir,
+            ffmpeg_bin=args.ffmpeg_bin,
+            ffprobe_bin=args.ffprobe_bin,
+        )
+        if not need_timestamps:
+            normalized = batched_transcribe_rows(
+                prepared_rows,
+                batch_size=max_inference_batch_size,
+                transcribe_batch=transcribe_batch,
             )
-            audio_duration_s = get_media_duration_seconds(
-                prepared_audio,
-                ffprobe_bin=args.ffprobe_bin,
-            )
+        else:
+            for row in prepared_rows:
+                request_timestamps = need_timestamps and timestamps_supported is not False
+                start_time = time.perf_counter()
+                result, used_timestamps = transcribe_with_timestamp_fallback(
+                    lambda return_ts: transcribe_one(row.prepared_audio, return_ts),
+                    request_timestamps=request_timestamps,
+                )
+                model_inference_time_s = time.perf_counter() - start_time
+                if request_timestamps and not used_timestamps:
+                    if timestamps_supported is not False:
+                        print(
+                            "[WARN] Timestamps disabled because forced aligner is not initialized. "
+                            "Falling back to coarse full-audio segments.",
+                            file=sys.stderr,
+                        )
+                    timestamps_supported = False
+                elif request_timestamps and used_timestamps:
+                    timestamps_supported = True
 
-            request_timestamps = need_timestamps and timestamps_supported is not False
-            start_time = time.perf_counter()
-            result, used_timestamps = transcribe_with_timestamp_fallback(
-                lambda return_ts: engine.transcribe(
-                    audio=prepared_audio,
-                    language=args.language,
-                    return_time_stamps=return_ts,
-                ),
-                request_timestamps=request_timestamps,
-            )
-            model_inference_time_s = time.perf_counter() - start_time
-            if request_timestamps and not used_timestamps:
-                if timestamps_supported is not False:
-                    print(
-                        "[WARN] Timestamps disabled because forced aligner is not initialized. "
-                        "Falling back to coarse full-audio segments.",
-                        file=sys.stderr,
-                    )
-                timestamps_supported = False
-            elif request_timestamps and used_timestamps:
-                timestamps_supported = True
+                text = result.get("text", "")
+                segments = build_time_segments(
+                    result.get("time_stamps") if used_timestamps else [],
+                    text=text,
+                    fallback_duration_s=row.audio_duration_s,
+                )
 
-            text = result.get("text", "")
-            segments = build_time_segments(
-                result.get("time_stamps") if used_timestamps else [],
-                text=text,
-                fallback_duration_s=audio_duration_s,
-            ) if need_timestamps else []
+                subtitle_path: str | None = None
+                if args.subtitle_dir:
+                    subtitle_target = build_subtitle_path(args.subtitle_dir, row.source_media)
+                    save_srt_file(segments, subtitle_target)
+                    subtitle_path = str(subtitle_target)
 
-            subtitle_path: str | None = None
-            if args.subtitle_dir:
-                subtitle_target = build_subtitle_path(args.subtitle_dir, media_path)
-                save_srt_file(segments, subtitle_target)
-                subtitle_path = str(subtitle_target)
-
-            normalized.append(
-                {
-                    "audio": media_path,
-                    "prepared_audio": prepared_audio,
-                    "source_type": "video" if was_extracted else "audio",
-                    "language": result.get("language"),
-                    "audio_duration_s": audio_duration_s,
-                    "model_inference_time_s": model_inference_time_s,
-                    "text": text,
-                    "segments": segments,
-                    "subtitle_path": subtitle_path,
-                }
-            )
+                normalized.append(
+                    {
+                        "audio": row.source_media,
+                        "prepared_audio": row.prepared_audio,
+                        "source_type": row.source_type,
+                        "language": result.get("language"),
+                        "audio_duration_s": row.audio_duration_s,
+                        "model_inference_time_s": model_inference_time_s,
+                        "text": text,
+                        "segments": segments,
+                        "subtitle_path": subtitle_path,
+                    }
+                )
 
     if args.output_format == "json":
         output = json.dumps(normalized, ensure_ascii=False, indent=2)

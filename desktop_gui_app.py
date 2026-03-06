@@ -5,6 +5,7 @@ import ctypes
 from ctypes import wintypes
 import gc
 import json
+import logging
 import os
 import re
 import shlex
@@ -75,7 +76,20 @@ from asr_media_utils import (
 )
 from desktop_service.config_models import AppConfig
 from desktop_service.config_store import ConfigStore
+from desktop_gui_runtime_utils import (
+    build_subtitle_output_path,
+    build_file_done_payload,
+    build_file_partial_payload,
+    build_file_start_payload,
+    extract_partial_text,
+    format_worker_failure,
+    requires_wav_conversion_for_chunking,
+    should_use_chunked_transcription,
+)
 from speech_output import QwenSpeechOutput
+
+
+logger = logging.getLogger(__name__)
 
 
 APP_STYLE = """
@@ -1181,6 +1195,11 @@ class AsrEngineCache:
             )
 
     @classmethod
+    def warmup(cls, cfg: RuntimeAsrConfig) -> bool:
+        engine = cls.get_engine(cfg)
+        return engine.warmup()
+
+    @classmethod
     def clear(cls) -> None:
         with cls._lock:
             cls._engine = None
@@ -1236,10 +1255,11 @@ class ModelLoadWorker(QObject):
                 {
                     "model_dir": self.cfg.model_dir,
                     "elapsed_s": time.perf_counter() - t0,
+                    "cfg": self.cfg,
                 }
             )
         except Exception as exc:  # noqa: BLE001
-            self.failed.emit(f"{exc}\n{traceback.format_exc(limit=2)}")
+            self.failed.emit(format_worker_failure(exc, traceback.format_exc(limit=2)))
 
 
 class AsrTaskWorker(QObject):
@@ -1297,16 +1317,15 @@ class AsrTaskWorker(QObject):
         model_time_s: float,
     ) -> None:
         self.progress.emit(
-            {
-                "event": "file_partial",
-                "index": index,
-                "total": total,
-                "source_media": source_media,
-                "file_progress_percent": int(max(0.0, min(1.0, file_progress)) * 100),
-                "progress_percent": int(max(0.0, min(1.0, global_progress)) * 100),
-                "current_text": current_text,
-                "model_inference_time_s": model_time_s,
-            }
+            build_file_partial_payload(
+                index=index,
+                total=total,
+                source_media=source_media,
+                file_progress=file_progress,
+                global_progress=global_progress,
+                current_text=current_text,
+                model_time_s=model_time_s,
+            )
         )
 
     def _request_timestamps_for_call(self) -> bool:
@@ -1479,15 +1498,13 @@ class AsrTaskWorker(QObject):
                 total = len(media_paths)
                 for idx, media_path in enumerate(media_paths, start=1):
                     self._check_cancel()
+                    resolved_media_path = str(Path(media_path).resolve())
                     self.progress.emit(
-                        {
-                            "event": "file_start",
-                            "index": idx,
-                            "total": total,
-                            "source_media": str(Path(media_path).resolve()),
-                            "progress_percent": int(((idx - 1) / float(max(total, 1))) * 100),
-                            "current_text": "",
-                        }
+                        build_file_start_payload(
+                            index=idx,
+                            total=total,
+                            source_media=resolved_media_path,
+                        )
                     )
 
                     prepared_audio, was_extracted = prepare_audio_input(
@@ -1501,25 +1518,31 @@ class AsrTaskWorker(QObject):
                     )
 
                     audio_for_model = prepared_audio
-                    use_chunk = False
-                    if audio_duration_s is not None and audio_duration_s >= self.chunk_enable_threshold_s:
-                        if Path(prepared_audio).suffix.lower() != ".wav":
-                            converted = (
-                                Path(temp_dir)
-                                / f"{Path(prepared_audio).stem}_{uuid.uuid4().hex[:8]}.wav"
-                            ).resolve()
-                            extract_audio_with_ffmpeg(
-                                input_media=prepared_audio,
-                                output_wav=converted,
-                                ffmpeg_bin=self.ffmpeg_bin,
-                            )
-                            audio_for_model = str(converted)
-                        use_chunk = Path(audio_for_model).suffix.lower() == ".wav"
+                    if requires_wav_conversion_for_chunking(
+                        audio_duration_s,
+                        prepared_audio,
+                        self.chunk_enable_threshold_s,
+                    ):
+                        converted = (
+                            Path(temp_dir)
+                            / f"{Path(prepared_audio).stem}_{uuid.uuid4().hex[:8]}.wav"
+                        ).resolve()
+                        extract_audio_with_ffmpeg(
+                            input_media=prepared_audio,
+                            output_wav=converted,
+                            ffmpeg_bin=self.ffmpeg_bin,
+                        )
+                        audio_for_model = str(converted)
+                    use_chunk = should_use_chunked_transcription(
+                        audio_duration_s,
+                        audio_for_model,
+                        self.chunk_enable_threshold_s,
+                    )
 
                     if use_chunk:
                         text, segments, model_time_s, detected_language = self._transcribe_chunked_wav(
                             wav_path=audio_for_model,
-                            source_media=str(Path(media_path).resolve()),
+                            source_media=resolved_media_path,
                             index=idx,
                             total=total,
                             total_duration_s=audio_duration_s,
@@ -1541,28 +1564,29 @@ class AsrTaskWorker(QObject):
                         )
 
                     subtitle_path: str | None = None
-                    if self.subtitle_dir and segments:
-                        subtitle_root = Path(self.subtitle_dir).expanduser().resolve()
-                        subtitle_root.mkdir(parents=True, exist_ok=True)
-                        target = subtitle_root / f"{Path(media_path).stem}.srt"
-                        save_srt_file(segments, target)
-                        subtitle_path = str(target)
+                    subtitle_target = build_subtitle_output_path(
+                        self.subtitle_dir,
+                        media_path,
+                        has_segments=bool(segments),
+                    )
+                    if subtitle_target is not None:
+                        subtitle_target.parent.mkdir(parents=True, exist_ok=True)
+                        save_srt_file(segments, subtitle_target)
+                        subtitle_path = str(subtitle_target)
 
-                    item = {
-                        "event": "file_done",
-                        "index": idx,
-                        "total": total,
-                        "source_media": str(Path(media_path).resolve()),
-                        "audio_path": str(Path(audio_for_model).resolve()),
-                        "was_extracted": was_extracted,
-                        "language": detected_language,
-                        "text": text,
-                        "audio_duration_s": audio_duration_s,
-                        "model_inference_time_s": model_time_s,
-                        "segments": segments,
-                        "subtitle_path": subtitle_path,
-                        "progress_percent": int((idx / float(max(total, 1))) * 100),
-                    }
+                    item = build_file_done_payload(
+                        index=idx,
+                        total=total,
+                        source_media=resolved_media_path,
+                        audio_path=str(Path(audio_for_model).resolve()),
+                        was_extracted=was_extracted,
+                        language=detected_language,
+                        text=text,
+                        audio_duration_s=audio_duration_s,
+                        model_inference_time_s=model_time_s,
+                        segments=segments,
+                        subtitle_path=subtitle_path,
+                    )
                     self.progress.emit(item)
                     results.append(item)
 
@@ -1571,11 +1595,9 @@ class AsrTaskWorker(QObject):
             if str(exc) == "__CANCELLED__":
                 self.cancelled.emit("用户已取消识别任务。")
                 return
-            detail = f"{exc}\n{traceback.format_exc(limit=2)}"
-            self.failed.emit(detail)
+            self.failed.emit(format_worker_failure(exc, traceback.format_exc(limit=2)))
         except Exception as exc:  # noqa: BLE001
-            detail = f"{exc}\n{traceback.format_exc(limit=2)}"
-            self.failed.emit(detail)
+            self.failed.emit(format_worker_failure(exc, traceback.format_exc(limit=2)))
 
 
 class _StreamPartialWorker(QObject):
@@ -1602,14 +1624,12 @@ class _StreamPartialWorker(QObject):
                     language=self._language,
                     return_time_stamps=False,
                 )
-                text = ""
-                if rows:
-                    text = str(rows[0].get("text", "") or "").strip()
+                text = extract_partial_text(rows)
                 self.result.emit(text)
             finally:
                 AsrEngineCache._infer_lock.release()
-        except Exception:  # noqa: BLE001
-            pass  # silently skip failures for streaming
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Partial stream transcription failed for %s: %s", self._wav_path, exc)
 
 
 class DesktopVoiceInputWindow(QMainWindow):
@@ -2530,11 +2550,44 @@ class DesktopVoiceInputWindow(QMainWindow):
     def _on_model_preload_loaded(self, payload: dict[str, Any]) -> None:
         model_dir = payload.get("model_dir", "")
         elapsed = payload.get("elapsed_s")
+        cfg = payload.get("cfg")
         self._append_log(
             f"[MODEL] loaded: {model_dir} in {format_hms(float(elapsed) if elapsed is not None else None)}"
         )
         self._set_asr_progress(0, "进度: 模型已就绪", None)
         self.label_record_state.setText("状态: 空闲")
+        if isinstance(cfg, RuntimeAsrConfig):
+            self._start_model_warmup(cfg, trigger="预加载完成")
+
+    def _start_model_warmup(self, cfg: RuntimeAsrConfig, trigger: str) -> None:
+        def _run() -> None:
+            try:
+                engine = AsrEngineCache.get_engine(cfg)
+                started = time.perf_counter()
+                warmed = engine.warmup()
+                elapsed_s = time.perf_counter() - started
+                if warmed:
+                    logger.info(
+                        "ASR warmup completed after %s for %s in %.2fs",
+                        trigger,
+                        cfg.model_dir,
+                        elapsed_s,
+                    )
+                else:
+                    logger.warning(
+                        "ASR warmup did not complete after %s for %s: %s",
+                        trigger,
+                        cfg.model_dir,
+                        getattr(getattr(engine, "_runtime", None), "warmup_error", None),
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("ASR warmup failed after %s for %s: %s", trigger, cfg.model_dir, exc)
+
+        threading.Thread(
+            target=_run,
+            name="gui-asr-warmup",
+            daemon=True,
+        ).start()
 
     def _on_model_preload_failed(self, detail: str) -> None:
         self._append_log(f"[MODEL][ERROR] {detail}")

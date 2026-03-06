@@ -38,3 +38,6 @@ venv/
 *.swp
 *.swo
 *~
+
+# Local git worktrees
+.worktrees/
